@@ -1,7 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { MessageSquare, Table2, Settings, Sparkles, Wifi, WifiOff, Database, Key, AlertCircle } from 'lucide-react';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { MessageSquare, Table2, Settings, Sparkles, Wifi, WifiOff, Database, Key, AlertCircle, RefreshCw } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import ChatPage from './pages/chat';
 import TablesPage from './pages/tables';
@@ -25,30 +25,121 @@ const tabs = [
   { id: 'settings', icon: Settings, label: 'Settings' },
 ] as const;
 
+const POLL_INTERVAL = 5000; // 10 seconds
+const MAX_RETRIES = 3;
+const RETRY_DELAY = 2000; // 2 seconds
+
 export default function Dashboard() {
   const [activeTab, setActiveTab] = useState<ActiveTab>('chat');
   const [configStatus, setConfigStatus] = useState<ConfigStatus | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [showStatusTooltip, setShowStatusTooltip] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [retryCount, setRetryCount] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+  
+  const intervalRef = useRef<NodeJS.Timeout | null>(null);
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  const fetchConfigStatus = useCallback(async (isManualRefresh = false) => {
+    if (isManualRefresh) {
+      setIsRefreshing(true);
+    }
+    
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/config/status', {
+        cache: 'no-cache',
+        headers: {
+          'Cache-Control': 'no-cache',
+        },
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      
+      const data = await response.json();
+      setConfigStatus(data);
+      setLastUpdate(new Date());
+      setIsLoading(false);
+      setError(null);
+      setRetryCount(0);
+      
+      if (isManualRefresh) {
+        setIsRefreshing(false);
+      }
+    } catch (err) {
+      console.error('Failed to fetch config status:', err);
+      setError(err instanceof Error ? err.message : 'Unknown error');
+      
+      if (isManualRefresh) {
+        setIsRefreshing(false);
+      }
+      
+      // Retry logic with exponential backoff
+      if (retryCount < MAX_RETRIES) {
+        const delay = RETRY_DELAY * Math.pow(2, retryCount);
+        console.log(`Retrying in ${delay}ms (attempt ${retryCount + 1}/${MAX_RETRIES})`);
+        
+        retryTimeoutRef.current = setTimeout(() => {
+          setRetryCount(prev => prev + 1);
+          fetchConfigStatus();
+        }, delay);
+      } else {
+        setIsLoading(false);
+        setConfigStatus(null);
+      }
+    }
+  }, [retryCount]);
+
+  const handleManualRefresh = useCallback(() => {
+    setRetryCount(0);
+    fetchConfigStatus(true);
+  }, [fetchConfigStatus]);
 
   useEffect(() => {
-    const fetchConfigStatus = async () => {
-      try {
-        const response = await fetch('http://127.0.0.1:8000/api/config/status');
-        const data = await response.json();
-        setConfigStatus(data);
-        setIsLoading(false);
-      } catch (error) {
-        console.error('Failed to fetch config status:', error);
-        setIsLoading(false);
+    // Initial fetch
+    fetchConfigStatus();
+    
+    // Start polling
+    const startPolling = () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+      intervalRef.current = setInterval(() => {
+        fetchConfigStatus();
+      }, POLL_INTERVAL);
+    };
+
+    // Handle visibility change
+    const handleVisibilityChange = () => {
+      if (document.hidden) {
+        // Stop polling when tab is hidden
+        if (intervalRef.current) {
+          clearInterval(intervalRef.current);
+          intervalRef.current = null;
+        }
+      } else {
+        // Resume polling and fetch immediately when tab becomes visible
+        fetchConfigStatus();
+        startPolling();
       }
     };
 
-    fetchConfigStatus();
-    // Poll every 30 seconds
-    const interval = setInterval(fetchConfigStatus, 30000);
-    return () => clearInterval(interval);
-  }, []);
+    startPolling();
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
+    return () => {
+      if (intervalRef.current) {
+        clearInterval(intervalRef.current);
+      }
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
+    };
+  }, [fetchConfigStatus]);
 
   const renderPage = () => {
     switch (activeTab) {
@@ -88,6 +179,7 @@ export default function Dashboard() {
   };
 
   const getStatusColor = () => {
+    if (error) return 'text-red-400';
     if (!configStatus) return 'text-white/30';
     if (configStatus.validation.is_valid) return 'text-green-400';
     if (configStatus.gemini_api_key_set || configStatus.db_url_set) return 'text-yellow-400';
@@ -95,10 +187,20 @@ export default function Dashboard() {
   };
 
   const getStatusIcon = () => {
-    if (isLoading) return Wifi;
-    if (!configStatus) return WifiOff;
+    if (isLoading || isRefreshing) return Wifi;
+    if (error || !configStatus) return WifiOff;
     if (configStatus.validation.is_valid) return Wifi;
     return AlertCircle;
+  };
+
+  const getTimeSinceUpdate = () => {
+    if (!lastUpdate) return '';
+    const seconds = Math.floor((Date.now() - lastUpdate.getTime()) / 1000);
+    if (seconds < 60) return `${seconds}s ago`;
+    const minutes = Math.floor(seconds / 60);
+    if (minutes < 60) return `${minutes}m ago`;
+    const hours = Math.floor(minutes / 60);
+    return `${hours}h ago`;
   };
 
   const StatusIcon = getStatusIcon();
@@ -264,14 +366,14 @@ export default function Dashboard() {
                 {/* Overall Connection Status */}
                 <motion.div
                   animate={
-                    isLoading
+                    isLoading || isRefreshing
                       ? { rotate: 360 }
                       : configStatus?.validation.is_valid
                       ? { scale: [1, 1.2, 1] }
                       : {}
                   }
                   transition={
-                    isLoading
+                    isLoading || isRefreshing
                       ? { duration: 2, repeat: Infinity, ease: 'linear' }
                       : { duration: 2, repeat: Infinity, delay: 1 }
                   }
@@ -302,82 +404,138 @@ export default function Dashboard() {
                   animate={{ opacity: 1, y: 0, scale: 1 }}
                   exit={{ opacity: 0, y: 10, scale: 0.9 }}
                   transition={{ duration: 0.2 }}
-                  className="absolute right-0 top-full mt-2 w-64 bg-black/90 backdrop-blur-xl border border-white/20 rounded-lg p-4 shadow-xl z-50"
+                  className="absolute right-0 top-full mt-2 w-72 bg-black/90 backdrop-blur-xl border border-white/20 rounded-lg p-4 shadow-xl z-50"
                 >
                   <div className="space-y-3">
                     <div className="flex items-center justify-between">
                       <span className="text-xs font-semibold text-white">
                         System Status
                       </span>
-                      {configStatus?.validation.is_valid ? (
+                      {error ? (
+                        <span className="text-xs px-2 py-0.5 bg-red-500/20 text-red-400 rounded-full">
+                          Error
+                        </span>
+                      ) : configStatus?.validation.is_valid ? (
                         <span className="text-xs px-2 py-0.5 bg-green-500/20 text-green-400 rounded-full">
                           Connected
                         </span>
                       ) : (
-                        <span className="text-xs px-2 py-0.5 bg-red-500/20 text-red-400 rounded-full">
+                        <span className="text-xs px-2 py-0.5 bg-yellow-500/20 text-yellow-400 rounded-full">
                           Issues Detected
                         </span>
                       )}
                     </div>
 
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-2">
-                        <Key
-                          size={14}
-                          className={
-                            configStatus?.gemini_api_key_set
-                              ? 'text-green-400'
-                              : 'text-red-400'
-                          }
-                        />
-                        <span className="text-xs text-white/70">
-                          Gemini API Key
-                        </span>
-                        <span className="ml-auto text-xs text-white/50">
-                          {configStatus?.gemini_api_key_set ? '✓' : '✗'}
-                        </span>
-                      </div>
+                    {/* Last Update Time */}
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="text-white/50">Last updated:</span>
+                      <span className="text-white/70">
+                        {lastUpdate ? getTimeSinceUpdate() : 'Never'}
+                      </span>
+                    </div>
 
-                      <div className="flex items-center gap-2">
-                        <Database
-                          size={14}
-                          className={
-                            configStatus?.db_url_set
-                              ? 'text-green-400'
-                              : 'text-red-400'
-                          }
-                        />
-                        <span className="text-xs text-white/70">
-                          Database URL
-                        </span>
-                        <span className="ml-auto text-xs text-white/50">
-                          {configStatus?.db_url_set ? '✓' : '✗'}
-                        </span>
-                      </div>
+                    {/* Refresh Button */}
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        handleManualRefresh();
+                      }}
+                      disabled={isRefreshing}
+                      className="w-full flex items-center justify-center gap-2 px-3 py-2 bg-white/10 hover:bg-white/15 disabled:bg-white/5 border border-white/20 rounded-lg transition-colors"
+                    >
+                      <motion.div
+                        animate={isRefreshing ? { rotate: 360 } : {}}
+                        transition={
+                          isRefreshing
+                            ? { duration: 1, repeat: Infinity, ease: 'linear' }
+                            : {}
+                        }
+                      >
+                        <RefreshCw size={14} className="text-white/70" />
+                      </motion.div>
+                      <span className="text-xs text-white/70">
+                        {isRefreshing ? 'Refreshing...' : 'Refresh Now'}
+                      </span>
+                    </button>
 
-                      {configStatus?.gemini_model && (
-                        <div className="flex items-center gap-2 pt-2 border-t border-white/10">
-                          <Sparkles size={14} className="text-purple-400" />
-                          <span className="text-xs text-white/70">Model</span>
-                          <span className="ml-auto text-xs text-white/50 font-mono">
-                            {configStatus.gemini_model}
+                    {/* Error Display */}
+                    {error && (
+                      <div className="pt-2 border-t border-white/10">
+                        <p className="text-xs text-red-400 font-medium mb-1">
+                          Connection Error:
+                        </p>
+                        <p className="text-xs text-white/50">
+                          {error}
+                        </p>
+                        {retryCount > 0 && retryCount < MAX_RETRIES && (
+                          <p className="text-xs text-white/40 mt-1">
+                            Retrying... ({retryCount}/{MAX_RETRIES})
+                          </p>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Configuration Details */}
+                    {!error && (
+                      <div className="space-y-2 pt-2 border-t border-white/10">
+                        <div className="flex items-center gap-2">
+                          <Key
+                            size={14}
+                            className={
+                              configStatus?.gemini_api_key_set
+                                ? 'text-green-400'
+                                : 'text-red-400'
+                            }
+                          />
+                          <span className="text-xs text-white/70">
+                            Gemini API Key
+                          </span>
+                          <span className="ml-auto text-xs text-white/50">
+                            {configStatus?.gemini_api_key_set ? '✓' : '✗'}
                           </span>
                         </div>
-                      )}
 
-                      {configStatus && configStatus.validation.missing.length > 0 && (
-                        <div className="pt-2 border-t border-white/10">
-                          <p className="text-xs text-red-400 font-medium mb-1">
-                            Missing:
-                          </p>
-                          {configStatus.validation.missing.map((item) => (
-                            <p key={item} className="text-xs text-white/50 ml-2">
-                              • {item}
-                            </p>
-                          ))}
+                        <div className="flex items-center gap-2">
+                          <Database
+                            size={14}
+                            className={
+                              configStatus?.db_url_set
+                                ? 'text-green-400'
+                                : 'text-red-400'
+                            }
+                          />
+                          <span className="text-xs text-white/70">
+                            Database URL
+                          </span>
+                          <span className="ml-auto text-xs text-white/50">
+                            {configStatus?.db_url_set ? '✓' : '✗'}
+                          </span>
                         </div>
-                      )}
-                    </div>
+
+                        {configStatus?.gemini_model && (
+                          <div className="flex items-center gap-2 pt-2 border-t border-white/10">
+                            <Sparkles size={14} className="text-purple-400" />
+                            <span className="text-xs text-white/70">Model</span>
+                            <span className="ml-auto text-xs text-white/50 font-mono">
+                              {configStatus.gemini_model}
+                            </span>
+                          </div>
+                        )}
+
+                        {configStatus && configStatus.validation.missing.length > 0 && (
+                          <div className="pt-2 border-t border-white/10">
+                            <p className="text-xs text-red-400 font-medium mb-1">
+                              Missing Configuration:
+                            </p>
+                            {configStatus.validation.missing.map((item) => (
+                              <p key={item} className="text-xs text-white/50 ml-2">
+                                • {item}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
 
                   {/* Tooltip Arrow */}
